@@ -511,6 +511,47 @@ read_cli_release_tag() {
   printf '%s\n' "$tag"
 }
 
+write_metadata_json() {
+  local version="$1"
+  local install_mode="$2"
+  local metadata_dir="$TARGET_DIR/.harness"
+  local metadata_file="$metadata_dir/metadata.json"
+  local installed_at
+  installed_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "create   .harness/metadata.json"
+    CREATED=$((CREATED + 1))
+    return 0
+  fi
+
+  mkdir -p "$metadata_dir"
+
+  local schema_version
+  schema_version="$(read_schema_version)"
+
+  cat >"$metadata_file" <<METADATA
+{
+  "version": "$version",
+  "installed_at": "$installed_at",
+  "install_mode": "$install_mode",
+  "cli_path": "scripts/bin/harness-cli",
+  "schema_version": $schema_version
+}
+METADATA
+
+  log "created  .harness/metadata.json"
+}
+
+read_schema_version() {
+  local db_path="$TARGET_DIR/harness.db"
+  if [ -f "$db_path" ] && command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 "$db_path" "SELECT COALESCE(MAX(version),0) FROM schema_version;" 2>/dev/null || echo "0"
+  else
+    echo "0"
+  fi
+}
+
 default_cli_base_url() {
   local release_tag="${HARNESS_CLI_RELEASE_TAG:-}"
 
@@ -866,6 +907,13 @@ EOF
 refresh_agent_shim
 write_claude_shim
 install_harness_cli_binary
+
+# Write metadata.json with version info
+CLI_RELEASE_TAG="$(read_cli_release_tag)"
+if [ -n "$CLI_RELEASE_TAG" ]; then
+  INSTALL_MODE="$CONFLICT_ACTION"
+  write_metadata_json "$CLI_RELEASE_TAG" "$INSTALL_MODE"
+fi
 
 log ""
 log "Done. Created: $CREATED, updated: $UPDATED, skipped: $SKIPPED."
