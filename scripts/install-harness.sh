@@ -512,12 +512,15 @@ read_cli_release_tag() {
 }
 
 write_metadata_json() {
-  local version="$1"
+  local tag="$1"
   local install_mode="$2"
   local metadata_dir="$TARGET_DIR/.harness"
   local metadata_file="$metadata_dir/metadata.json"
   local installed_at
   installed_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+  # Strip "harness-cli-" prefix if present
+  local version="${tag#harness-cli-}"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     log "create   .harness/metadata.json"

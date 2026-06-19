@@ -1490,11 +1490,15 @@ fn fetch_latest_version() -> Result<String> {
     let json = String::from_utf8(output.stdout)
         .map_err(|e| HarnessInfraError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
     
-    extract_json_string(&json, "tag_name")
+    let tag_name = extract_json_string(&json, "tag_name")
         .ok_or_else(|| HarnessInfraError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Could not parse tag_name from GitHub response",
-        )))
+        )))?;
+
+    // Strip "harness-cli-" prefix if present
+    let version = tag_name.strip_prefix("harness-cli-").unwrap_or(&tag_name);
+    Ok(version.to_string())
 }
 
 #[derive(Debug)]
