@@ -22,6 +22,12 @@ use crate::domain::{
     TraceScoreSource,
 };
 
+/// Minimum schema version this CLI requires.
+pub const MINIMUM_SCHEMA_VERSION: i64 = 1;
+
+/// Maximum schema version this CLI supports.
+pub const MAXIMUM_SCHEMA_VERSION: i64 = 7;
+
 pub type Result<T> = std::result::Result<T, HarnessInfraError>;
 
 #[derive(Debug, Error)]
@@ -54,6 +60,8 @@ pub enum HarnessInfraError {
     NoTraces,
     #[error("story update: nothing to update")]
     EmptyStoryUpdate,
+    #[error("schema version mismatch: {0}")]
+    SchemaVersionMismatch(String),
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("io error: {0}")]
@@ -135,6 +143,7 @@ impl SqliteHarnessRepository {
 
         let connection = Connection::open(&self.db_path)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        Self::check_schema_version(&connection)?;
         Ok(connection)
     }
 
@@ -154,6 +163,24 @@ impl SqliteHarnessRepository {
             .optional()?
             .unwrap_or(0);
         Ok(version)
+    }
+
+    fn check_schema_version(connection: &Connection) -> Result<()> {
+        let version = Self::schema_version(connection)?;
+        if version < MINIMUM_SCHEMA_VERSION {
+            return Err(HarnessInfraError::SchemaVersionMismatch(format!(
+                "This CLI requires schema version {MINIMUM_SCHEMA_VERSION}-{MAXIMUM_SCHEMA_VERSION}. \
+                 Current database has schema version {version}. Run: harness-cli migrate"
+            )));
+        }
+        if version > MAXIMUM_SCHEMA_VERSION {
+            return Err(HarnessInfraError::SchemaVersionMismatch(format!(
+                "This CLI requires schema version {MINIMUM_SCHEMA_VERSION}-{MAXIMUM_SCHEMA_VERSION}. \
+                 Current database has schema version {version}. \
+                 This may indicate a CLI downgrade. Install the latest CLI."
+            )));
+        }
+        Ok(())
     }
 
     fn apply_schema_v1(&self, connection: &Connection) -> Result<()> {
@@ -3012,5 +3039,61 @@ implemented
         assert_eq!(specific.achieved, TraceQualityTier::Minimal);
         assert_eq!(specific.required, None);
         assert!(specific.meets_requirement);
+    }
+
+    #[test]
+    fn test_version_gate_ok() {
+        let (_temp_dir, repository) = test_repository();
+        repository.init().unwrap();
+        let connection = repository.open_existing().unwrap();
+        let version = SqliteHarnessRepository::schema_version(&connection).unwrap();
+        assert!(version >= MINIMUM_SCHEMA_VERSION);
+        assert!(version <= MAXIMUM_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_version_gate_too_old() {
+        let (_temp_dir, repository) = test_repository();
+        repository.init().unwrap();
+        let connection = repository.open_existing().unwrap();
+        // Manually set schema version to 0 (below minimum)
+        connection
+            .execute("DELETE FROM schema_version", [])
+            .unwrap();
+        drop(connection);
+
+        let result = repository.open_existing();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("requires schema version"));
+        assert!(msg.contains("Run: harness-cli migrate"));
+    }
+
+    #[test]
+    fn test_version_gate_too_new() {
+        let (_temp_dir, repository) = test_repository();
+        repository.init().unwrap();
+        let connection = repository.open_existing().unwrap();
+        // Manually insert a version above maximum
+        connection
+            .execute("INSERT INTO schema_version (version) VALUES (99)", [])
+            .unwrap();
+        drop(connection);
+
+        let result = repository.open_existing();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("requires schema version"));
+        assert!(msg.contains("CLI downgrade"));
+    }
+
+    #[test]
+    fn test_version_gate_skips_init() {
+        let (_temp_dir, repository) = test_repository();
+        // init should work without an existing database
+        let result = repository.init();
+        assert!(result.is_ok());
     }
 }
