@@ -10,8 +10,8 @@ use thiserror::Error;
 use crate::application::{
     BacklogAddInput, BacklogCloseInput, BrownfieldImportResult, DecisionAddInput,
     DecisionVerifyResult, HarnessContext, InitResult, IntakeInput, InterventionAddInput,
-    InterventionFilter, MigrateResult, QueryTable, StoryAddInput, StoryUpdateInput,
-    StoryVerifyResult, ToolRegisterInput, TraceInput,
+    InterventionFilter, MigrateResult, OutdatedResult, QueryTable, StoryAddInput,
+    StoryUpdateInput, StoryVerifyResult, ToolRegisterInput, TraceInput, VersionInfo,
 };
 use crate::domain::{
     compiled_tool_registry, normalize_token, score_context, score_trace, validate_tool_description,
@@ -108,6 +108,8 @@ pub trait HarnessRepository {
     fn audit(&self) -> Result<AuditResult>;
     fn propose(&self, commit: bool) -> Result<Vec<ImprovementProposal>>;
     fn query_sql(&self, sql: &str) -> Result<QueryTable>;
+    fn get_version_info(&self) -> Result<VersionInfo>;
+    fn check_outdated(&self) -> Result<OutdatedResult>;
 }
 
 #[derive(Debug)]
@@ -1398,12 +1400,101 @@ impl HarnessRepository for SqliteHarnessRepository {
             rows: collect_rows(rows)?,
         })
     }
+
+    fn get_version_info(&self) -> Result<VersionInfo> {
+        let cli_version = env!("CARGO_PKG_VERSION").to_string();
+        let metadata_path = self.repo_root.join(".harness").join("metadata.json");
+        
+        let (installed_version, installed_at, install_mode) = if metadata_path.exists() {
+            let content = fs::read_to_string(&metadata_path)?;
+            (
+                extract_json_string(&content, "version"),
+                extract_json_string(&content, "installed_at"),
+                extract_json_string(&content, "install_mode"),
+            )
+        } else {
+            (None, None, None)
+        };
+
+        let schema_version = if self.db_path.exists() {
+            let connection = self.open_existing()?;
+            Some(Self::schema_version(&connection)?)
+        } else {
+            None
+        };
+
+        Ok(VersionInfo {
+            cli_version,
+            installed_version,
+            schema_version,
+            installed_at,
+            install_mode,
+        })
+    }
+
+    fn check_outdated(&self) -> Result<OutdatedResult> {
+        let version_info = self.get_version_info()?;
+        let installed_version = version_info
+            .installed_version
+            .unwrap_or_else(|| "0.0.0".to_string());
+
+        let latest_version = fetch_latest_version().unwrap_or_else(|_| {
+            eprintln!("Warning: Could not fetch latest version. Check your network connection.");
+            installed_version.clone()
+        });
+
+        let is_outdated = installed_version != latest_version;
+
+        Ok(OutdatedResult {
+            installed_version,
+            latest_version,
+            is_outdated,
+        })
+    }
 }
 
 impl From<HarnessContext> for SqliteHarnessRepository {
     fn from(context: HarnessContext) -> Self {
         Self::new(context.repo_root, context.db_path, context.schema_dir)
     }
+}
+
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\":", key);
+    let start = json.find(&pattern)? + pattern.len();
+    let rest = json[start..].trim_start();
+    if rest.starts_with('"') {
+        let value_start = 1;
+        let value_end = rest[value_start..].find('"')?;
+        Some(rest[value_start..value_start + value_end].to_string())
+    } else {
+        None
+    }
+}
+
+fn fetch_latest_version() -> Result<String> {
+    let output = Command::new("curl")
+        .args([
+            "-s",
+            "-L",
+            "https://api.github.com/repos/hoangnb24/repository-harness/releases/latest",
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(HarnessInfraError::Io(std::io::Error::other(
+            "Failed to fetch latest version",
+        )));
+    }
+
+    let json = String::from_utf8(output.stdout)
+        .map_err(|e| HarnessInfraError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    
+    extract_json_string(&json, "tag_name")
+        .ok_or_else(|| HarnessInfraError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Could not parse tag_name from GitHub response",
+        )))
 }
 
 #[derive(Debug)]
@@ -1950,6 +2041,22 @@ mod tests {
             repo_root.clone(),
             temp_dir.path().join("harness.db"),
             repo_root.join("scripts/schema"),
+        );
+        (temp_dir, repository)
+    }
+
+    fn test_repository_with_temp_root() -> (TempDir, SqliteHarnessRepository) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_root = temp_dir.path().to_path_buf();
+        let schema_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .join("scripts/schema");
+        let repository = SqliteHarnessRepository::new(
+            repo_root,
+            temp_dir.path().join("harness.db"),
+            schema_dir,
         );
         (temp_dir, repository)
     }
@@ -3012,5 +3119,91 @@ implemented
         assert_eq!(specific.achieved, TraceQualityTier::Minimal);
         assert_eq!(specific.required, None);
         assert!(specific.meets_requirement);
+    }
+
+    #[test]
+    fn test_version_info_without_metadata() {
+        let (_temp_dir, repository) = test_repository_with_temp_root();
+        repository.init().unwrap();
+
+        let info = repository.get_version_info().unwrap();
+        assert_eq!(info.cli_version, env!("CARGO_PKG_VERSION"));
+        assert!(info.installed_version.is_none());
+        assert!(info.schema_version.is_some());
+        assert!(info.installed_at.is_none());
+        assert!(info.install_mode.is_none());
+    }
+
+    #[test]
+    fn test_version_info_with_metadata() {
+        let (_temp_dir, repository) = test_repository_with_temp_root();
+        repository.init().unwrap();
+
+        // Create .harness/metadata.json
+        let harness_dir = repository.repo_root.join(".harness");
+        fs::create_dir_all(&harness_dir).unwrap();
+        let metadata = r#"{
+            "version": "0.1.10",
+            "installed_at": "2026-06-19T10:30:00Z",
+            "install_mode": "fresh",
+            "cli_path": "scripts/bin/harness-cli",
+            "schema_version": 5
+        }"#;
+        fs::write(harness_dir.join("metadata.json"), metadata).unwrap();
+
+        let info = repository.get_version_info().unwrap();
+        assert_eq!(info.cli_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(info.installed_version, Some("0.1.10".to_string()));
+        assert_eq!(info.schema_version, Some(5));
+        assert_eq!(info.installed_at, Some("2026-06-19T10:30:00Z".to_string()));
+        assert_eq!(info.install_mode, Some("fresh".to_string()));
+    }
+
+    #[test]
+    fn test_check_outdated_without_metadata() {
+        let (_temp_dir, repository) = test_repository_with_temp_root();
+        repository.init().unwrap();
+
+        let result = repository.check_outdated();
+        assert!(result.is_ok());
+        // Without metadata, installed_version defaults to "0.0.0"
+        let outdated = result.unwrap();
+        assert_eq!(outdated.installed_version, "0.0.0");
+    }
+
+    #[test]
+    fn test_check_outdated_with_metadata() {
+        let (_temp_dir, repository) = test_repository_with_temp_root();
+        repository.init().unwrap();
+
+        // Create .harness/metadata.json with old version
+        let harness_dir = repository.repo_root.join(".harness");
+        fs::create_dir_all(&harness_dir).unwrap();
+        let metadata = r#"{
+            "version": "0.1.0",
+            "installed_at": "2026-06-19T10:30:00Z",
+            "install_mode": "fresh",
+            "cli_path": "scripts/bin/harness-cli",
+            "schema_version": 5
+        }"#;
+        fs::write(harness_dir.join("metadata.json"), metadata).unwrap();
+
+        let result = repository.check_outdated();
+        assert!(result.is_ok());
+        let outdated = result.unwrap();
+        assert_eq!(outdated.installed_version, "0.1.0");
+        // latest_version will be fetched from GitHub or fall back to installed_version
+        assert!(!outdated.latest_version.is_empty());
+    }
+
+    #[test]
+    fn test_extract_json_string() {
+        let json = r#"{"version": "0.1.10", "installed_at": "2026-06-19T10:30:00Z"}"#;
+        assert_eq!(extract_json_string(json, "version"), Some("0.1.10".to_string()));
+        assert_eq!(
+            extract_json_string(json, "installed_at"),
+            Some("2026-06-19T10:30:00Z".to_string())
+        );
+        assert_eq!(extract_json_string(json, "missing"), None);
     }
 }

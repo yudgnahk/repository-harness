@@ -1,0 +1,7 @@
+{
+            "version": "0.1.10",
+            "installed_at": "2026-06-19T10:30:00Z",
+            "install_mode": "fresh",
+            "cli_path": "scripts/bin/harness-cli",
+            "schema_version": 5
+        }

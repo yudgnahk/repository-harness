@@ -60,6 +60,10 @@ enum Command {
     Propose(ProposeArgs),
     /// Query harness data.
     Query(QueryArgs),
+    /// Show version information for the installed harness.
+    Version,
+    /// Check if a newer harness version is available.
+    Outdated,
 }
 
 #[derive(Args, Debug)]
@@ -688,6 +692,8 @@ pub fn run(cli: Cli) -> Result<(), InterfaceError> {
                 print_query_table(&service.query_sql(&query.join(" "))?);
             }
         },
+        Command::Version => print_version(&service.get_version_info()?),
+        Command::Outdated => print_outdated(&service.check_outdated()?),
     }
 
     Ok(())
@@ -825,6 +831,43 @@ fn print_audit_category(label: &str, findings: &[crate::domain::AuditFinding]) {
     println!("{label}: {}", findings.len());
     for finding in findings {
         println!("  - {}: {}", finding.id, finding.title);
+    }
+}
+
+fn print_version(info: &crate::application::VersionInfo) {
+    println!("CLI:           {}", info.cli_version);
+    match &info.installed_version {
+        Some(version) => println!("Installed:     {version}"),
+        None => println!("Installed:     unknown (no .harness/metadata.json)"),
+    }
+    match info.schema_version {
+        Some(version) => println!("Schema:        {version}"),
+        None => println!("Schema:        unknown (no database)"),
+    }
+    match &info.installed_at {
+        Some(timestamp) => {
+            let mode = info.install_mode.as_deref().unwrap_or("unknown");
+            println!("Last install:  {timestamp} ({mode})");
+        }
+        None => println!("Last install:  unknown"),
+    }
+    if info.installed_version.is_none() {
+        println!();
+        println!("Warning: No .harness/metadata.json found.");
+        println!("Run the installer to create it:");
+        println!("  curl -fsSL \"https://raw.githubusercontent.com/hoangnb24/repository-harness/main/scripts/install-harness.sh\" | bash");
+    }
+}
+
+fn print_outdated(result: &crate::application::OutdatedResult) {
+    println!("Installed:  {}", result.installed_version);
+    println!("Latest:     {}", result.latest_version);
+    if result.is_outdated {
+        println!("Status:     OUTDATED");
+        println!();
+        println!("Run: curl -fsSL \"https://raw.githubusercontent.com/hoangnb24/repository-harness/main/scripts/install-harness.sh\" | bash -s -- --merge --yes");
+    } else {
+        println!("Status:     CURRENT");
     }
 }
 
@@ -1416,5 +1459,19 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(matrix_help.contains("--numeric"));
+    }
+
+    #[test]
+    fn version_command_exists() {
+        let mut command = Cli::command();
+        let version = command.find_subcommand_mut("version");
+        assert!(version.is_some());
+    }
+
+    #[test]
+    fn outdated_command_exists() {
+        let mut command = Cli::command();
+        let outdated = command.find_subcommand_mut("outdated");
+        assert!(outdated.is_some());
     }
 }

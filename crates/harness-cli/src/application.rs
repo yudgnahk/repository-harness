@@ -286,6 +286,14 @@ impl HarnessService {
     pub fn query_sql(&self, sql: &str) -> crate::infrastructure::Result<QueryTable> {
         self.repository.query_sql(sql)
     }
+
+    pub fn get_version_info(&self) -> crate::infrastructure::Result<VersionInfo> {
+        self.repository.get_version_info()
+    }
+
+    pub fn check_outdated(&self) -> crate::infrastructure::Result<OutdatedResult> {
+        self.repository.check_outdated()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -326,4 +334,20 @@ pub struct StoryVerifyResult {
 pub struct QueryTable {
     pub headers: Vec<String>,
     pub rows: Vec<Vec<String>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct VersionInfo {
+    pub cli_version: String,
+    pub installed_version: Option<String>,
+    pub schema_version: Option<i64>,
+    pub installed_at: Option<String>,
+    pub install_mode: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct OutdatedResult {
+    pub installed_version: String,
+    pub latest_version: String,
+    pub is_outdated: bool,
 }
