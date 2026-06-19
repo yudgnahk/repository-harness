@@ -28,6 +28,8 @@ pub type Result<T> = std::result::Result<T, HarnessInfraError>;
 pub enum HarnessInfraError {
     #[error("database not found at {0}. Run: harness init")]
     MissingDatabase(String),
+    #[error("backup not found at {0}. Cannot repair.")]
+    MissingBackup(String),
     #[error("schema file missing: {0}")]
     MissingSchema(String),
     #[error("brownfield import: missing {0}")]
@@ -73,7 +75,7 @@ pub struct ToolCheckResult {
 
 pub trait HarnessRepository {
     fn init(&self) -> Result<InitResult>;
-    fn migrate(&self) -> Result<MigrateResult>;
+    fn migrate(&self, repair: bool, dry_run: bool) -> Result<MigrateResult>;
     fn import_brownfield(&self) -> Result<BrownfieldImportResult>;
     fn record_intake(&self, input: IntakeInput) -> Result<i64>;
     fn add_story(&self, input: StoryAddInput) -> Result<()>;
@@ -156,6 +158,39 @@ impl SqliteHarnessRepository {
         Ok(version)
     }
 
+    fn backup_database(&self) -> Result<()> {
+        if !self.db_path.exists() {
+            return Ok(());
+        }
+
+        let backup_path = self.db_path.with_extension("db.bak");
+        fs::copy(&self.db_path, &backup_path)?;
+        println!("Backup created: {}", backup_path.display());
+        Ok(())
+    }
+
+    fn repair_database(&self) -> Result<MigrateResult> {
+        let backup_path = self.db_path.with_extension("db.bak");
+
+        if !backup_path.exists() {
+            return Err(HarnessInfraError::MissingBackup(
+                backup_path.display().to_string(),
+            ));
+        }
+
+        fs::copy(&backup_path, &self.db_path)?;
+        println!("Database restored from {}", backup_path.display());
+
+        let connection = self.open_existing()?;
+        let current_version = Self::schema_version(&connection).unwrap_or(0);
+
+        Ok(MigrateResult {
+            current_version,
+            applied: vec![],
+            backup_created: false,
+        })
+    }
+
     fn apply_schema_v1(&self, connection: &Connection) -> Result<()> {
         let schema_path = self.schema_dir.join("001-init.sql");
         if !schema_path.exists() {
@@ -183,6 +218,40 @@ impl SqliteHarnessRepository {
             }
         }
         Ok(applied)
+    }
+
+    fn dry_run_migrations(
+        &self,
+        _connection: &Connection,
+        current_version: i64,
+    ) -> Result<MigrateResult> {
+        let mut pending = Vec::new();
+        for (version, path) in self.migration_files()? {
+            if version > current_version {
+                let sql = fs::read_to_string(path)?;
+                let first_line = sql.lines().find(|l| !l.starts_with("--")).unwrap_or("");
+                println!("Migration {version}: {first_line}");
+                pending.push(version);
+            }
+        }
+
+        if pending.is_empty() {
+            println!("Already up to date.");
+        } else {
+            let max_version = pending.last().unwrap();
+            println!(
+                "Would apply {} migration(s) (schema {} -> {}).",
+                pending.len(),
+                current_version,
+                max_version
+            );
+        }
+
+        Ok(MigrateResult {
+            current_version,
+            applied: vec![],
+            backup_created: false,
+        })
     }
 
     fn migration_files(&self) -> Result<Vec<(i64, PathBuf)>> {
@@ -441,14 +510,27 @@ impl HarnessRepository for SqliteHarnessRepository {
         })
     }
 
-    fn migrate(&self) -> Result<MigrateResult> {
+    fn migrate(&self, repair: bool, dry_run: bool) -> Result<MigrateResult> {
+        if repair {
+            return self.repair_database();
+        }
+
         let connection = self.open_existing()?;
         let current_version = Self::schema_version(&connection).unwrap_or(0);
+
+        if dry_run {
+            return self.dry_run_migrations(&connection, current_version);
+        }
+
+        // Backup before migration
+        self.backup_database()?;
+
         let applied = self.apply_pending_migrations(&connection, current_version)?;
 
         Ok(MigrateResult {
             current_version,
             applied,
+            backup_created: true,
         })
     }
 
@@ -1986,10 +2068,11 @@ mod tests {
         repository.apply_schema_v1(&connection).unwrap();
         drop(connection);
 
-        let result = repository.migrate().unwrap();
+        let result = repository.migrate(false, false).unwrap();
 
         assert_eq!(result.current_version, 1);
         assert_eq!(result.applied, vec![2, 3, 4, 5]);
+        assert!(result.backup_created);
         let connection = repository.open_existing().unwrap();
         assert_eq!(
             SqliteHarnessRepository::schema_version(&connection).unwrap(),
@@ -2043,7 +2126,7 @@ mod tests {
         drop(connection);
 
         // Upgrade: migration 005 must infer kind from the command prefix.
-        assert_eq!(repository.migrate().unwrap().applied, vec![5]);
+        assert_eq!(repository.migrate(false, false).unwrap().applied, vec![5]);
         let connection = repository.open_existing().unwrap();
         let kind_of = |name: &str| -> String {
             connection
@@ -3012,5 +3095,112 @@ implemented
         assert_eq!(specific.achieved, TraceQualityTier::Minimal);
         assert_eq!(specific.required, None);
         assert!(specific.meets_requirement);
+    }
+
+    #[test]
+    fn migrate_creates_backup() {
+        let (_temp_dir, repository) = test_repository();
+        repository.init().unwrap();
+
+        let result = repository.migrate(false, false).unwrap();
+
+        assert!(result.backup_created);
+        assert!(repository.db_path.with_extension("db.bak").exists());
+    }
+
+    #[test]
+    fn migrate_repair_restores_from_backup() {
+        let (_temp_dir, repository) = test_repository();
+        repository.init().unwrap();
+
+        // Create a backup by running migrate
+        repository.migrate(false, false).unwrap();
+
+        // Corrupt the database
+        fs::write(&repository.db_path, "corrupted").unwrap();
+
+        // Repair should restore from backup
+        let result = repository.migrate(true, false).unwrap();
+
+        assert_eq!(result.current_version, 5);
+        assert!(result.applied.is_empty());
+
+        // Verify database is valid again
+        let connection = repository.open_existing().unwrap();
+        let version = SqliteHarnessRepository::schema_version(&connection).unwrap();
+        assert_eq!(version, 5);
+    }
+
+    #[test]
+    fn migrate_repair_fails_without_backup() {
+        let (_temp_dir, repository) = test_repository();
+        repository.init().unwrap();
+
+        // Delete backup if it exists
+        let backup_path = repository.db_path.with_extension("db.bak");
+        if backup_path.exists() {
+            fs::remove_file(&backup_path).unwrap();
+        }
+
+        // Repair should fail
+        let result = repository.migrate(true, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn migrate_backup_overwrites_previous() {
+        let (_temp_dir, repository) = test_repository();
+        repository.init().unwrap();
+
+        // First migration creates backup
+        repository.migrate(false, false).unwrap();
+        let backup_path = repository.db_path.with_extension("db.bak");
+        assert!(backup_path.exists());
+
+        // Modify the database after backup
+        let connection = repository.open_existing().unwrap();
+        connection
+            .execute("INSERT INTO intake (input_type, summary, risk_lane) VALUES ('new_spec', 'test', 'tiny')", [])
+            .unwrap();
+        drop(connection);
+
+        // Second migration should overwrite backup with current state
+        repository.migrate(false, false).unwrap();
+
+        // The backup should contain the insertion
+        let backup_connection = Connection::open(&backup_path).unwrap();
+        let count: i64 = backup_connection
+            .query_row("SELECT COUNT(*) FROM intake", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn migrate_dry_run_shows_pending_without_applying() {
+        let (_temp_dir, repository) = test_repository();
+        let connection = repository.open_or_create().unwrap();
+        repository.apply_schema_v1(&connection).unwrap();
+        drop(connection);
+
+        let result = repository.migrate(false, true).unwrap();
+
+        assert_eq!(result.current_version, 1);
+        assert!(result.applied.is_empty());
+        assert!(!result.backup_created);
+
+        // Verify migrations were NOT applied
+        let connection = repository.open_existing().unwrap();
+        let version = SqliteHarnessRepository::schema_version(&connection).unwrap();
+        assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn migrate_dry_run_no_backup_created() {
+        let (_temp_dir, repository) = test_repository();
+        repository.init().unwrap();
+
+        let _result = repository.migrate(false, true).unwrap();
+
+        assert!(!repository.db_path.with_extension("db.bak").exists());
     }
 }

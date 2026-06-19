@@ -144,8 +144,8 @@ impl HarnessService {
         self.repository.init()
     }
 
-    pub fn migrate(&self) -> crate::infrastructure::Result<MigrateResult> {
-        self.repository.migrate()
+    pub fn migrate(&self, repair: bool, dry_run: bool) -> crate::infrastructure::Result<MigrateResult> {
+        self.repository.migrate(repair, dry_run)
     }
 
     pub fn import_brownfield(&self) -> crate::infrastructure::Result<BrownfieldImportResult> {
@@ -299,6 +299,7 @@ pub enum InitResult {
 pub struct MigrateResult {
     pub current_version: i64,
     pub applied: Vec<i64>,
+    pub backup_created: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
