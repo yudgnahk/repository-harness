@@ -33,7 +33,7 @@ enum Command {
     /// Create the harness database if it does not already exist.
     Init,
     /// Apply schema migrations.
-    Migrate,
+    Migrate(MigrateArgs),
     /// Seed or refresh the database from existing markdown state.
     Import(ImportArgs),
     /// Record a feature intake classification.
@@ -79,6 +79,17 @@ struct IntakeArgs {
     story: Option<String>,
     #[arg(long)]
     notes: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct MigrateArgs {
+    /// Restore the database from the last backup.
+    #[arg(long)]
+    repair: bool,
+
+    /// Show what migrations would be applied without executing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -440,7 +451,7 @@ pub fn run(cli: Cli) -> Result<(), InterfaceError> {
 
     match cli.command {
         Command::Init => print_init_result(service.init()?),
-        Command::Migrate => print_migrate_result(service.migrate()?),
+        Command::Migrate(args) => print_migrate_result(service.migrate(args.repair, args.dry_run)?),
         Command::Import(args) => match args.source {
             ImportSource::Brownfield => {
                 print_brownfield_import_result(service.import_brownfield()?)
@@ -940,6 +951,9 @@ fn print_init_result(result: InitResult) {
 }
 
 fn print_migrate_result(result: MigrateResult) {
+    if result.backup_created {
+        println!("Backup created before migration.");
+    }
     println!("Current schema version: {}", result.current_version);
     if result.applied.is_empty() {
         println!("Already up to date.");

@@ -20,7 +20,9 @@ scripts/bin/harness-cli trace ...     # Record and auto-score an agent execution
 scripts/bin/harness-cli score-trace   # Score a trace against TRACE_SPEC.md tiers
 scripts/bin/harness-cli query ...     # Query harness data, including backlog --open/--closed
 scripts/bin/harness-cli query matrix --numeric  # Show proof flags as 1/0
-scripts/bin/harness-cli migrate       # Apply pending schema migrations
+scripts/bin/harness-cli migrate       # Apply pending schema migrations (creates backup)
+scripts/bin/harness-cli migrate --dry-run  # Show what migrations would be applied
+scripts/bin/harness-cli migrate --repair  # Restore database from last backup
 scripts/bin/harness-cli --version     # Print the installed CLI version
 ```
 
